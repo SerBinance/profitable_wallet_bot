@@ -156,13 +156,28 @@ class TokenTracker:
         # Filter and sort
         qualified = []
         for wallet in traders:
-            ok = await self._verify_wallet(wallet["address"], chain)
-            if ok:
-                wallet.update(ok)
-                qualified.append(wallet)
+            # Check age and prior tx count BEFORE this trade
+             ok = await self._verify_wallet(wallet["address"], chain, wallet.get("first_trade_timestamp"))
+             if not ok:
+             continue
 
-        # Sort by profit descending
-        qualified.sort(key=lambda w: w.get("profit_usd", 0), reverse=True)
+             # Check wallet is 30+ days old
+             if ok["age_days"] < Config.MIN_WALLET_AGE_DAYS:
+             continue
+
+             # Check wallet had 2+ transactions before entering this token trade
+             if ok["prior_tx_count"] < Config.MIN_PRIOR_TX:
+             continue
+
+             # Check profit is 300%+
+             if wallet.get("profit_percent", 0) < Config.MIN_PROFIT_PERCENT:
+             continue
+
+             wallet.update(ok)
+             qualified.append(wallet)
+
+       # Sort by profit descending
+       qualified.sort(key=lambda w: w.get("profit_usd", 0), reverse=True)
         return qualified[:10]
 
     # ── EVM trader discovery ───────────────────────────────────────────────────
@@ -233,23 +248,34 @@ class TokenTracker:
                             traders[addr]["sells"] += 1
                             traders[addr]["sell_value"] += value
 
+                tx_timestamp = int(tx.get("timeStamp", 0))
+                if "first_trade_timestamp" not in traders[addr] or tx_timestamp < traders[addr]["first_trade_timestamp"]:
+                traders[addr]["first_trade_timestamp"] = tx_timestamp                       
+
         except Exception as e:
             logger.warning(f"EVM trader fetch error: {e}")
 
         # Build result list — skip wallets with 0 buys (transfer-only)
         result = []
         for addr, t in traders.items():
-            if t["buys"] == 0:  # transfer-only
-                continue
-            profit = t["sell_value"] - t["buy_value"]   # token units; USD needs price feed
-            result.append({
-                "address": addr,
-                "buys": t["buys"],
-                "sells": t["sells"],
-                "profit_usd": profit * 1.0,  # approximation; replace with price * units
-                "win_rate": (t["sells"] / max(t["buys"], 1)) * 100,
-                "tx_count": t["buys"] + t["sells"],
-            })
+        if t["buys"] == 0:  # skip transfer-only wallets
+        continue
+        if t["buy_value"] == 0:
+        continue
+
+        profit = t["sell_value"] - t["buy_value"]
+        profit_percent = (profit / t["buy_value"]) * 100
+
+        result.append({
+            "address": addr,
+            "buys": t["buys"],
+            "sells": t["sells"],
+            "profit_usd": profit,
+            "profit_percent": profit_percent,
+            "win_rate": (t["sells"] / max(t["buys"], 1)) * 100,
+            "tx_count": t["buys"] + t["sells"],
+            "first_trade_timestamp": t.get("first_trade_timestamp", 0),
+        })
 
         return result
 
@@ -311,7 +337,7 @@ class TokenTracker:
         return result
 
     # ── Wallet verification ────────────────────────────────────────────────────
-    async def _verify_wallet(self, address: str, chain: str) -> Optional[dict]:
+    async def _verify_wallet(self, address: str, chain: str, first_trade_timestamp: int = 0) -> Optional[dict]:
         """
         Returns wallet metadata if it passes all filters, else None.
         Checks: age >= MIN_WALLET_AGE_DAYS, tx_count >= MIN_TX_COUNT.
@@ -354,8 +380,19 @@ class TokenTracker:
                 if age_days < Config.MIN_WALLET_AGE_DAYS:
                     return None
 
-                return {"age_days": age_days, "tx_count": len(txs)}
-        except Exception as e:
+               # Count transactions that happened BEFORE this wallet's first trade on the token
+            prior_tx_count = 0
+            if first_trade_timestamp:
+              prior_tx_count = sum(1 for tx in txs if int(tx.get("timeStamp", 0)) < first_trade_timestamp)
+            else:
+            prior_tx_count = len(txs)
+
+            return {
+             "age_days": age_days,
+             "tx_count": len(txs),
+                "prior_tx_count": prior_tx_count,
+            }
+            except Exception as e:
             logger.debug(f"EVM wallet verify error {address}: {e}")
             return None
 
@@ -383,7 +420,17 @@ class TokenTracker:
                 if age_days < Config.MIN_WALLET_AGE_DAYS:
                     return None
 
-                return {"age_days": age_days, "tx_count": len(txs)}
+                prior_tx_count = 0
+        if first_trade_timestamp:
+        prior_tx_count = sum(1 for tx in txs if tx.get("blockTime", 0) < first_trade_timestamp)
+        else:
+         prior_tx_count = len(txs)
+
+    return {
+        "age_days": age_days,
+        "tx_count": len(txs),
+        "prior_tx_count": prior_tx_count,
+    }
         except Exception as e:
             logger.debug(f"Solana wallet verify error {address}: {e}")
             return None

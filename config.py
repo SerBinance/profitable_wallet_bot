@@ -21,8 +21,10 @@ class Config:
     SOLSCAN_API_KEY: str    = os.getenv("SOLSCAN_API_KEY", "")    # optional, free tier works
 
     # ── Wallet filter settings ────────────────────────────────────────────────
-    MIN_WALLET_AGE_DAYS: int = int(os.getenv("MIN_WALLET_AGE_DAYS", "30"))   # 30–60 days
-    MIN_TX_COUNT: int        = int(os.getenv("MIN_TX_COUNT", "5"))            # must have used the wallet
+    MIN_WALLET_AGE_DAYS: int  = int(os.getenv("MIN_WALLET_AGE_DAYS", "30"))
+    MIN_TX_COUNT: int         = int(os.getenv("MIN_TX_COUNT", "5"))
+    MIN_PROFIT_PERCENT: float = float(os.getenv("MIN_PROFIT_PERCENT", "300"))
+    MIN_PRIOR_TX: int         = int(os.getenv("MIN_PRIOR_TX", "2"))
 
     # ── Scan settings ─────────────────────────────────────────────────────────
     TOP_TOKENS_COUNT: int    = int(os.getenv("TOP_TOKENS_COUNT", "10"))

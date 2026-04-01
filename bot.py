@@ -131,14 +131,11 @@ async def scan_wallets_command(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             for j, w in enumerate(wallets[:10], 1):
                 profit_str = f"+${w['profit_usd']:,.2f}" if w['profit_usd'] >= 0 else f"-${abs(w['profit_usd']):,.2f}"
-                text += (
-                    f"{j}. `{w['address']}`\n"
-                    f"   💵 Profit: *{profit_str}* | "
-                    f"Age: {w['age_days']}d | "
-                    f"Txns: {w['tx_count']}\n"
-                    f"   Buys: {w['buys']} | Sells: {w['sells']} | "
-                    f"Win Rate: {w['win_rate']:.0f}%\n\n"
-                )
+        text += (
+            f"{j}. `{w['address']}`\n"
+            f"   💵 Profit: *{profit_str}* ({w.get('profit_percent', 0):+.0f}%) | Age: {w['age_days']}d\n"
+            f"   Prior Txns: {w.get('prior_tx_count', 0)} | Buys: {w['buys']} | Sells: {w['sells']}\n\n"
+        )
             await msg.reply_text(text, parse_mode="Markdown")
             await asyncio.sleep(0.5)
 
