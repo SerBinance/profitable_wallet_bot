@@ -7,22 +7,21 @@ Token & Wallet Tracker
 
 import asyncio
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Optional
 import aiohttp
 from config import Config
 
 logger = logging.getLogger(__name__)
 
-# Known router / aggregator addresses to skip (add more as needed)
 KNOWN_ROUTERS = {
     # Ethereum / EVM
-    "0x7a250d5630b4cf539739df2c5dacb4c659f2488d",  # Uniswap V2 router
-    "0xe592427a0aece92de3edee1f18e0157c05861564",  # Uniswap V3 router
-    "0xd9e1ce17f2641f24ae83637ab66a2cca9c378b9f",  # Sushiswap router
+    "0x7a250d5630b4cf539739df2c5dacb4c659f2488d",  # Uniswap V2
+    "0xe592427a0aece92de3edee1f18e0157c05861564",  # Uniswap V3
+    "0xd9e1ce17f2641f24ae83637ab66a2cca9c378b9f",  # Sushiswap
     "0x1111111254fb6c44bac0bed2854e76f90643097d",  # 1inch v4
     "0x1111111254eeb25477b68fb85ed929f73a960582",  # 1inch v5
-    # Solana (base58 — add common Solana programs)
+    # Solana (base58 programs)
     "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  # Raydium AMM
     "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP",  # Orca
     "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",   # Jupiter
@@ -42,18 +41,14 @@ class TokenTracker:
             )
         return self._session
 
-    # ── Trending tokens ────────────────────────────────────────────────────────
+    # ── Trending tokens ──────────────────────────────────────────────
     async def get_trending_tokens(self) -> list[dict]:
-        """Fetch top trending tokens from DexScreener boosted/trending endpoint."""
         session = await self._get_session()
         tokens = []
 
-        # DexScreener trending endpoint
+        # DexScreener boosted
         try:
-            async with session.get(
-                "https://api.dexscreener.com/token-boosts/top/v1",
-                headers={"Accept": "application/json"}
-            ) as resp:
+            async with session.get("https://api.dexscreener.com/token-boosts/top/v1") as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     for item in data[:30]:
@@ -64,13 +59,10 @@ class TokenTracker:
         except Exception as e:
             logger.warning(f"DexScreener boosted fetch error: {e}")
 
-        # Fallback: search for high-volume pairs
+        # Fallback search
         if len(tokens) < 10:
             try:
-                async with session.get(
-                    "https://api.dexscreener.com/latest/dex/search?q=trending",
-                    headers={"Accept": "application/json"}
-                ) as resp:
+                async with session.get("https://api.dexscreener.com/latest/dex/search?q=trending") as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         for pair in data.get("pairs", [])[:30]:
@@ -81,7 +73,7 @@ class TokenTracker:
             except Exception as e:
                 logger.warning(f"DexScreener search fallback error: {e}")
 
-        # Deduplicate by address
+        # Deduplicate
         seen = set()
         unique = []
         for t in tokens:
@@ -90,7 +82,7 @@ class TokenTracker:
                 seen.add(key)
                 unique.append(t)
 
-        # Enrich with pair data
+        # Enrich with token info
         enriched = []
         for t in unique[:20]:
             info = await self.get_token_info(t["address"], chain=t["chain"])
@@ -103,7 +95,6 @@ class TokenTracker:
         return enriched
 
     async def get_token_info(self, address: str, chain: str = "") -> Optional[dict]:
-        """Fetch token metadata & price data from DexScreener."""
         session = await self._get_session()
         try:
             url = f"https://api.dexscreener.com/latest/dex/tokens/{address}"
@@ -115,8 +106,12 @@ class TokenTracker:
                 if not pairs:
                     return None
 
-                # Pick the highest-liquidity pair
-                pair = sorted(pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0), reverse=True)[0]
+                pair = sorted(
+                    pairs,
+                    key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0),
+                    reverse=True
+                )[0]
+
                 base = pair.get("baseToken", {})
                 vol = pair.get("volume", {})
                 price_change = pair.get("priceChange", {})
@@ -136,59 +131,43 @@ class TokenTracker:
             logger.warning(f"get_token_info error for {address}: {e}")
             return None
 
-    # ── Profitable wallets ─────────────────────────────────────────────────────
+    # ── Profitable wallets ──────────────────────────────────────────────
     async def get_profitable_wallets(self, token: dict) -> list[dict]:
-        """
-        Find wallets that:
-        1. Made a profit trading this token
-        2. Are >= MIN_WALLET_AGE_DAYS old
-        3. Have at least MIN_TX_COUNT prior transactions
-        4. Are NOT routers, devs, or transfer-only wallets
-        """
         chain = token.get("chain", "").lower()
 
         if "solana" in chain or chain == "solana":
             traders = await self._get_solana_traders(token)
         else:
-            # EVM (Ethereum, BSC, Base, Arbitrum, etc.)
             traders = await self._get_evm_traders(token)
 
-        # Filter and sort
         qualified = []
         for wallet in traders:
-            # Check age and prior tx count BEFORE this trade
-             ok = await self._verify_wallet(wallet["address"], chain, wallet.get("first_trade_timestamp"))
-             if not ok:
-             continue
+            ok = await self._verify_wallet(wallet["address"], chain, wallet.get("first_trade_timestamp"))
+            if not ok:
+                continue
 
-             # Check wallet is 30+ days old
-             if ok["age_days"] < Config.MIN_WALLET_AGE_DAYS:
-             continue
+            if ok["age_days"] < Config.MIN_WALLET_AGE_DAYS:
+                continue
 
-             # Check wallet had 2+ transactions before entering this token trade
-             if ok["prior_tx_count"] < Config.MIN_PRIOR_TX:
-             continue
+            if ok["prior_tx_count"] < Config.MIN_PRIOR_TX:
+                continue
 
-             # Check profit is 300%+
-             if wallet.get("profit_percent", 0) < Config.MIN_PROFIT_PERCENT:
-             continue
+            if wallet.get("profit_percent", 0) < Config.MIN_PROFIT_PERCENT:
+                continue
 
-             wallet.update(ok)
-             qualified.append(wallet)
+            wallet.update(ok)
+            qualified.append(wallet)
 
-       # Sort by profit descending
-       qualified.sort(key=lambda w: w.get("profit_usd", 0), reverse=True)
+        qualified.sort(key=lambda w: w.get("profit_usd", 0), reverse=True)
         return qualified[:10]
 
-    # ── EVM trader discovery ───────────────────────────────────────────────────
+    # ── EVM traders ──────────────────────────────────────────────────────
     async def _get_evm_traders(self, token: dict) -> list[dict]:
-        """Fetch swap events from the pair and compute PnL per wallet."""
         session = await self._get_session()
         chain = token.get("chain", "").lower()
         pair_address = token.get("pair_address", "")
         token_address = token.get("address", "")
 
-        # Map chain to explorer API base + key env var
         explorer_map = {
             "ethereum": ("https://api.etherscan.io/api", Config.ETHERSCAN_API_KEY),
             "bsc": ("https://api.bscscan.com/api", Config.BSCSCAN_API_KEY),
@@ -228,19 +207,17 @@ class TokenTracker:
                     sender = tx.get("from", "").lower()
                     receiver = tx.get("to", "").lower()
 
-                    # Skip routers and zero address
                     if sender in KNOWN_ROUTERS or receiver in KNOWN_ROUTERS:
                         continue
                     if sender.startswith("0x000000"):
                         continue
 
                     value = int(tx.get("value", 0)) / (10 ** int(tx.get("tokenDecimal", 18)))
-                    price = float(tx.get("gasPrice", 0))  # placeholder; real price needs additional call
-
                     for addr in [sender, receiver]:
                         if addr not in traders:
                             traders[addr] = {"address": addr, "buys": 0, "sells": 0,
                                              "buy_value": 0.0, "sell_value": 0.0}
+
                         if addr == receiver:
                             traders[addr]["buys"] += 1
                             traders[addr]["buy_value"] += value
@@ -248,46 +225,41 @@ class TokenTracker:
                             traders[addr]["sells"] += 1
                             traders[addr]["sell_value"] += value
 
-                tx_timestamp = int(tx.get("timeStamp", 0))
-                if "first_trade_timestamp" not in traders[addr] or tx_timestamp < traders[addr]["first_trade_timestamp"]:
-                traders[addr]["first_trade_timestamp"] = tx_timestamp                       
-
+                        tx_timestamp = int(tx.get("timeStamp", 0))
+                        if "first_trade_timestamp" not in traders[addr] or tx_timestamp < traders[addr]["first_trade_timestamp"]:
+                            traders[addr]["first_trade_timestamp"] = tx_timestamp
         except Exception as e:
             logger.warning(f"EVM trader fetch error: {e}")
 
-        # Build result list — skip wallets with 0 buys (transfer-only)
+        # Build result list — skip transfer-only wallets
         result = []
         for addr, t in traders.items():
-        if t["buys"] == 0:  # skip transfer-only wallets
-        continue
-        if t["buy_value"] == 0:
-        continue
+            if t["buys"] == 0 or t["buy_value"] == 0:
+                continue
 
-        profit = t["sell_value"] - t["buy_value"]
-        profit_percent = (profit / t["buy_value"]) * 100
+            profit = t["sell_value"] - t["buy_value"]
+            profit_percent = (profit / t["buy_value"]) * 100 if t["buy_value"] else 0
 
-        result.append({
-            "address": addr,
-            "buys": t["buys"],
-            "sells": t["sells"],
-            "profit_usd": profit,
-            "profit_percent": profit_percent,
-            "win_rate": (t["sells"] / max(t["buys"], 1)) * 100,
-            "tx_count": t["buys"] + t["sells"],
-            "first_trade_timestamp": t.get("first_trade_timestamp", 0),
-        })
+            result.append({
+                "address": addr,
+                "buys": t["buys"],
+                "sells": t["sells"],
+                "profit_usd": profit,
+                "profit_percent": profit_percent,
+                "win_rate": (t["sells"] / max(t["buys"], 1)) * 100,
+                "tx_count": t["buys"] + t["sells"],
+                "first_trade_timestamp": t.get("first_trade_timestamp", 0),
+            })
 
         return result
 
-    # ── Solana trader discovery ────────────────────────────────────────────────
+    # ── Solana traders ────────────────────────────────────────────────────
     async def _get_solana_traders(self, token: dict) -> list[dict]:
-        """Use Solscan API to find profitable traders of a Solana token."""
         session = await self._get_session()
         mint = token.get("address", "")
         traders: dict[str, dict] = {}
 
         try:
-            # Solscan token holders & transfer history
             url = f"https://public-api.solscan.io/token/transfer?tokenAddress={mint}&limit=200&offset=0"
             headers = {}
             if Config.SOLSCAN_API_KEY:
@@ -316,7 +288,6 @@ class TokenTracker:
                         else:
                             traders[addr]["sells"] += 1
                             traders[addr]["sell_value"] += amount
-
         except Exception as e:
             logger.warning(f"Solana trader fetch error: {e}")
 
@@ -336,18 +307,14 @@ class TokenTracker:
 
         return result
 
-    # ── Wallet verification ────────────────────────────────────────────────────
+    # ── Wallet verification ──────────────────────────────────────────────
     async def _verify_wallet(self, address: str, chain: str, first_trade_timestamp: int = 0) -> Optional[dict]:
-        """
-        Returns wallet metadata if it passes all filters, else None.
-        Checks: age >= MIN_WALLET_AGE_DAYS, tx_count >= MIN_TX_COUNT.
-        """
         if "solana" in chain or chain == "solana":
-            return await self._verify_solana_wallet(address)
+            return await self._verify_solana_wallet(address, first_trade_timestamp)
         else:
-            return await self._verify_evm_wallet(address, chain)
+            return await self._verify_evm_wallet(address, chain, first_trade_timestamp)
 
-    async def _verify_evm_wallet(self, address: str, chain: str) -> Optional[dict]:
+    async def _verify_evm_wallet(self, address: str, chain: str, first_trade_timestamp: int = 0) -> Optional[dict]:
         session = await self._get_session()
         explorer_map = {
             "ethereum": ("https://api.etherscan.io/api", Config.ETHERSCAN_API_KEY),
@@ -380,23 +347,19 @@ class TokenTracker:
                 if age_days < Config.MIN_WALLET_AGE_DAYS:
                     return None
 
-               # Count transactions that happened BEFORE this wallet's first trade on the token
-            prior_tx_count = 0
-            if first_trade_timestamp:
-              prior_tx_count = sum(1 for tx in txs if int(tx.get("timeStamp", 0)) < first_trade_timestamp)
-            else:
-            prior_tx_count = len(txs)
+                prior_tx_count = sum(1 for tx in txs if int(tx.get("timeStamp", 0)) < first_trade_timestamp) \
+                    if first_trade_timestamp else len(txs)
 
-            return {
-             "age_days": age_days,
-             "tx_count": len(txs),
-                "prior_tx_count": prior_tx_count,
-            }
-            except Exception as e:
+                return {
+                    "age_days": age_days,
+                    "tx_count": len(txs),
+                    "prior_tx_count": prior_tx_count,
+                }
+        except Exception as e:
             logger.debug(f"EVM wallet verify error {address}: {e}")
             return None
 
-    async def _verify_solana_wallet(self, address: str) -> Optional[dict]:
+    async def _verify_solana_wallet(self, address: str, first_trade_timestamp: int = 0) -> Optional[dict]:
         session = await self._get_session()
         try:
             url = f"https://public-api.solscan.io/account/transactions?account={address}&limit=10"
@@ -412,7 +375,6 @@ class TokenTracker:
                 if len(txs) < Config.MIN_TX_COUNT:
                     return None
 
-                # Solscan returns blockTime in unix seconds
                 oldest_ts = min(tx.get("blockTime", 9999999999) for tx in txs)
                 first_date = datetime.fromtimestamp(oldest_ts, tz=timezone.utc)
                 age_days = (datetime.now(timezone.utc) - first_date).days
@@ -420,17 +382,14 @@ class TokenTracker:
                 if age_days < Config.MIN_WALLET_AGE_DAYS:
                     return None
 
-                prior_tx_count = 0
-        if first_trade_timestamp:
-        prior_tx_count = sum(1 for tx in txs if tx.get("blockTime", 0) < first_trade_timestamp)
-        else:
-         prior_tx_count = len(txs)
+                prior_tx_count = sum(1 for tx in txs if tx.get("blockTime", 0) < first_trade_timestamp) \
+                    if first_trade_timestamp else len(txs)
 
-    return {
-        "age_days": age_days,
-        "tx_count": len(txs),
-        "prior_tx_count": prior_tx_count,
-    }
+                return {
+                    "age_days": age_days,
+                    "tx_count": len(txs),
+                    "prior_tx_count": prior_tx_count,
+                }
         except Exception as e:
             logger.debug(f"Solana wallet verify error {address}: {e}")
             return None
