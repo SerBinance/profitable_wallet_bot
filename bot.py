@@ -122,22 +122,29 @@ async def scan_wallets_command(update: Update, context: ContextTypes.DEFAULT_TYP
             return
 
         for token, wallets in results:
-            text = (
-                f"💰 *{token['symbol']}* ({token['chain']})\n"
-                f"Token: `{token['address']}`\n"
-                f"24h Vol: ${token['volume_24h']:,.0f} | "
-                f"Price Δ: {token['price_change_24h']:+.1f}%\n\n"
-                f"*Top Profitable Wallets (aged & verified):*\n\n"
-            )
-            for j, w in enumerate(wallets[:10], 1):
-                profit_str = f"+${w['profit_usd']:,.2f}" if w['profit_usd'] >= 0 else f"-${abs(w['profit_usd']):,.2f}"
+    text = (
+        f"💰 *{token['symbol']}* ({token['chain']})\n"
+        f"Token: `{token['address']}`\n"
+        f"24h Vol: ${token['volume_24h']:,.0f} | "
+        f"Price Δ: {token['price_change_24h']:+.1f}%\n\n"
+        f"*Top Profitable Wallets (aged & verified):*\n\n"
+    )
+
+    for j, w in enumerate(wallets[:10], 1):
+        profit_str = (
+            f"+${w['profit_usd']:,.2f}"
+            if w['profit_usd'] >= 0
+            else f"-${abs(w['profit_usd']):,.2f}"
+        )
+
         text += (
             f"{j}. `{w['address']}`\n"
             f"   💵 Profit: *{profit_str}* ({w.get('profit_percent', 0):+.0f}%) | Age: {w['age_days']}d\n"
             f"   Prior Txns: {w.get('prior_tx_count', 0)} | Buys: {w['buys']} | Sells: {w['sells']}\n\n"
         )
-            await msg.reply_text(text, parse_mode="Markdown")
-            await asyncio.sleep(0.5)
+
+    await msg.reply_text(text, parse_mode="Markdown")
+    await asyncio.sleep(0.5)
 
     except Exception as e:
         logger.error(f"scan_wallets error: {e}")
