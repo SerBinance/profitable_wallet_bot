@@ -1,159 +1,98 @@
-import logging
-from datetime import datetime, timezone
-from typing import Optional
 import aiohttp
+import asyncio
+from datetime import datetime, timezone
 from config import Config
-
-logger = logging.getLogger(__name__)
-
-DEX_ROUTERS = {
-    "0x7a250d5630b4cf539739df2c5dacb4c659f2488d",  # Uniswap V2
-    "0xe592427a0aece92de3edee1f18e0157c05861564",  # Uniswap V3
-}
 
 class TokenTracker:
     def __init__(self):
-        self._session: Optional[aiohttp.ClientSession] = None
+        self.min_age = Config.MIN_WALLET_AGE_DAYS
+        self.min_tx = Config.MIN_TX_COUNT
+        self.min_prior_tx = Config.MIN_PRIOR_TX
+        self.min_profit = Config.MIN_PROFIT_PERCENT
+        self.top_tokens_count = Config.TOP_TOKENS_COUNT
+        self.top_wallets_count = Config.TOP_WALLETS_COUNT
+        self.alchemy_url = Config.ALCHEMY_API_URL
+        self.etherscan_key = Config.ETHERSCAN_API_KEY
 
-    async def _get_session(self):
-        if not self._session or self._session.closed:
-            self._session = aiohttp.ClientSession()
-        return self._session
-
-    # ── Trending tokens ─────────────────────────
+    # ── Fetch top trending tokens ─────────────────────────
     async def get_trending_tokens(self):
-        session = await self._get_session()
-
-        url = "https://api.dexscreener.com/latest/dex/search?q=trending"
-
-        async with session.get(url) as resp:
-            data = await resp.json()
+        url = "https://api.dexscreener.com/latest/dex/trending"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
 
         tokens = []
-        for pair in data.get("pairs", [])[:10]:
+        for t in data.get("pairs", [])[:self.top_tokens_count]:
             tokens.append({
-                "address": pair["baseToken"]["address"],
-                "symbol": pair["baseToken"]["symbol"],
-                "chain": pair["chainId"]
+                "symbol": t["baseToken"]["symbol"],
+                "chain": t["chainId"],
+                "address": t["baseToken"]["address"],
+                "volume_24h": t["volumeUsd24h"],
+                "price_change_24h": t.get("priceChangePct24h", 0) * 100
             })
-
         return tokens
 
-    # ── MAIN: REAL PROFIT ───────────────────────
+    # ── Fetch profitable wallets for a token ─────────────
     async def get_profitable_wallets(self, token):
-        transfers = await self._get_transfers(token["address"])
+        # Etherscan API to get token transfers
+        url = (
+            f"https://api.etherscan.io/api"
+            f"?module=account"
+            f"&action=tokentx"
+            f"&contractaddress={token['address']}"
+            f"&sort=desc"
+            f"&apikey={self.etherscan_key}"
+        )
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
 
         wallets = {}
+        now = datetime.now(timezone.utc)
 
-        for tx in transfers:
-            from_addr = tx["from"].lower()
-            to_addr = tx["to"].lower()
-            value = float(tx["value"])
-            usd = float(tx.get("value_usd", 0))
+        for tx in data.get("result", []):
+            addr = tx["from"]
+            timestamp = datetime.fromtimestamp(int(tx["timeStamp"]), tz=timezone.utc)
+            age_days = (now - timestamp).days
 
-            # Detect BUY (wallet receives from router)
-            if from_addr in DEX_ROUTERS:
-                wallet = to_addr
-
-                wallets.setdefault(wallet, {"buy_usd": 0, "sell_usd": 0})
-                wallets[wallet]["buy_usd"] += usd
-
-            # Detect SELL (wallet sends to router)
-            elif to_addr in DEX_ROUTERS:
-                wallet = from_addr
-
-                wallets.setdefault(wallet, {"buy_usd": 0, "sell_usd": 0})
-                wallets[wallet]["sell_usd"] += usd
-
-        results = []
-
-        for addr, data in wallets.items():
-            if data["buy_usd"] == 0:
+            # Skip young wallets
+            if age_days < self.min_age:
                 continue
 
-            profit = data["sell_usd"] - data["buy_usd"]
-            roi = (profit / data["buy_usd"]) * 100
+            if addr not in wallets:
+                wallets[addr] = {
+                    "address": addr,
+                    "tx_count": 0,
+                    "buys": 0,
+                    "sells": 0,
+                    "first_tx": timestamp,
+                    "last_tx": timestamp,
+                    "profit_percent": 0
+                }
 
-            if roi < Config.MIN_PROFIT_PERCENT:
-                continue
+            wallets[addr]["tx_count"] += 1
+            wallets[addr]["last_tx"] = max(wallets[addr]["last_tx"], timestamp)
 
-            verified = await self._verify_wallet(addr)
-            if not verified:
-                continue
+            # Simplified profit tracking (mock)
+            if tx["to"].lower() == addr.lower():
+                wallets[addr]["buys"] += 1
+                wallets[addr]["profit_percent"] += float(tx["value"]) * 0.0001
+            else:
+                wallets[addr]["sells"] += 1
+                wallets[addr]["profit_percent"] -= float(tx["value"]) * 0.0001
 
-            results.append({
-                "address": addr,
-                "profit_usd": profit,
-                "profit_percent": roi,
-                **verified
-            })
+        # Filter profitable wallets
+        result = [
+            {**w, "age_days": (now - w["first_tx"]).days, "score": w["tx_count"]}
+            for w in wallets.values()
+            if w["tx_count"] >= self.min_prior_tx and w["profit_percent"] >= self.min_profit
+        ]
 
-        results.sort(key=lambda x: x["profit_percent"], reverse=True)
-        return results[:10]
-
-    # ── Get transfers from Alchemy ───────────────
-    async def _get_transfers(self, token_address):
-        session = await self._get_session()
-
-        url = Config.ALCHEMY_URL
-
-        payload = {
-            "jsonrpc": "2.0",
-            "method": "alchemy_getAssetTransfers",
-            "params": [{
-                "contractAddresses": [token_address],
-                "category": ["erc20"],
-                "withMetadata": True,
-                "maxCount": "0x3e8"
-            }],
-            "id": 1
-        }
-
-        async with session.post(url, json=payload) as resp:
-            data = await resp.json()
-
-        transfers = data.get("result", {}).get("transfers", [])
-
-        # Attach rough USD (price not perfect but usable)
-        for t in transfers:
-            t["value_usd"] = float(t.get("value", 0)) * 0.0001  # placeholder
-
-        return transfers
-
-    # ── Wallet verification ─────────────────────
-    async def _verify_wallet(self, address):
-        session = await self._get_session()
-
-        url = Config.ALCHEMY_URL
-
-        payload = {
-            "jsonrpc": "2.0",
-            "method": "alchemy_getAssetTransfers",
-            "params": [{
-                "fromAddress": address,
-                "category": ["external"],
-                "maxCount": "0xa"
-            }],
-            "id": 1
-        }
-
-        async with session.post(url, json=payload) as resp:
-            data = await resp.json()
-
-        txs = data.get("result", {}).get("transfers", [])
-
-        if len(txs) < Config.MIN_TX_COUNT:
-            return None
-
-        first_time = txs[-1]["metadata"]["blockTimestamp"]
-        dt = datetime.fromisoformat(first_time.replace("Z", "+00:00"))
-
-        age_days = (datetime.now(timezone.utc) - dt).days
-
-        if age_days < Config.MIN_WALLET_AGE_DAYS:
-            return None
-
-        return {
-            "age_days": age_days,
-            "tx_count": len(txs)
-        }
+        # Sort by score or profit
+        result.sort(key=lambda x: x["profit_percent"], reverse=True)
+        return result[:self.top_wallets_count]
